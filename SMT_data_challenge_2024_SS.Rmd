@@ -1,0 +1,1032 @@
+---
+title: "Team1-code"
+author: "Team 1"
+date: "2024-08-09"
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(knitr)
+library(rmarkdown)
+
+rmarkdown::render("SMT_data_challenge_2024_SS.Rmd", 
+                  output_format = rmarkdown::html_document(pandoc_args = "--self-contained"),
+                  output_file = "Team1-code.html")
+
+
+browseURL("SMT_data_challenge_2024_SS.html")
+```
+
+```{r}
+# packages to load neccessary functions
+
+library(ggplot2)
+library(dplyr)
+library(zoo)
+library(arrow)
+library(data.table)
+library(caret)
+library(xgboost)
+library(progress)
+library(tidyr)
+```
+
+``` {r}
+# working directory and starter code
+
+data_directory <- '2024_SMT_Data_Challenge/2024_SMT_Data_Challenge'
+
+game_info <- arrow::open_csv_dataset(paste0(data_directory,"/game_info"), 
+                                     partitioning = c("Season", "HomeTeam", "AwayTeam", "Day"), 
+                                     hive_style = F, 
+                                     unify_schemas = T, 
+                                     na = c("", "NA", "NULL", NA, "\\N"))
+
+ball_pos <- arrow::open_csv_dataset(paste0(data_directory,"/ball_pos"), 
+                                    partitioning = c("Season", "HomeTeam", "AwayTeam", "Day"), 
+                                    hive_style = F, 
+                                    unify_schemas = T, 
+                                    na = c("", "NA", "NULL", NA, "\\N"))
+
+game_events <- arrow::open_csv_dataset(paste0(data_directory,"/game_events"), 
+                                       partitioning = c("Season", "HomeTeam", "AwayTeam", "Day"), 
+                                       hive_style = F, 
+                                       unify_schemas = T, 
+                                       na = c("", "NA", "NULL", NA, "\\N"))
+
+player_pos <- arrow::open_csv_dataset(paste0(data_directory,"/player_pos"), 
+                                      partitioning = c("Season", "HomeTeam", "AwayTeam", "Day"), 
+                                      hive_style = F, 
+                                      unify_schemas = T, 
+                                      na = c("", "NA", "NULL", NA, "\\N"))
+
+team_info <- arrow::open_csv_dataset(paste0(data_directory,"/team_info.csv"), 
+                                     hive_style = F, 
+                                     unify_schemas = T, 
+                                     na = c("", "NA", "NULL", NA, "\\N"))
+```
+
+``` {r}
+# collecting the data
+
+game_info <- game_info |>
+   collect()
+
+ball_pos <- ball_pos |>
+  select(-Season, -Day, -HomeTeam, -AwayTeam) |>
+   collect()
+
+game_events <- game_events |>
+   select(-Season, -Day, -HomeTeam, -AwayTeam) |>
+   collect()
+ 
+player_pos <- player_pos |>
+   collect()
+ 
+team_info <- team_info|> 
+   collect()
+```
+
+```{r}
+# merging data into one set
+
+# filter player pos data so it's not too big
+player_pos_ss_4A <- player_pos %>% 
+  filter(HomeTeam == "Home4A", player_position == "6")
+# filter ball pos so it matches player pos
+ball_pos_4A <- ball_pos %>% 
+  filter(grepl("_Home4A", game_str))
+# filter game events so it matches player pos
+game_events_4A <- game_events %>% 
+  filter(grepl("_Home4A", game_str))
+# filter game info to make sure the correct players have ids in master data
+game_info_4A <- game_info %>%
+  filter(grepl("_Home4A", game_str) & is.na(first_baserunner) & is.na(second_baserunner)) %>%
+  select(game_str, play_per_game, pitcher, shortstop, batter)
+# merge each df into master df
+smt_df_ss_4A <- merge(player_pos_ss_4A, ball_pos_4A, by = c("game_str", "play_id", "timestamp"), all = TRUE)
+smt_df_ss_4A <- merge(smt_df_ss_4A, game_events_4A, by = c("game_str", "play_id", "timestamp"), all = TRUE)
+smt_df_ss_4A <- merge(smt_df_ss_4A, game_info_4A, by = c("game_str", "play_per_game"), all = TRUE)
+```
+
+```{r}
+# write a csv for the shortstop master df
+write.csv(smt_df_ss_4A, "SMT_4A_ss.csv")
+```
+
+``` {r}
+# cleaning the main data frame first version
+main_4A <- smt_df_ss_4A %>%
+  select(-player_position.y) %>%
+  mutate(
+    event_code = case_when(
+      event_code == 1 ~ "pitch",
+      event_code == 2 ~ "ball_acquired",
+      event_code == 3 ~ "throw_bip",
+      event_code == 4 ~ "ball_hit_into_play",
+      event_code == 5 ~ "end_of_play",
+      event_code == 6 ~ "pickoff_throw",
+      event_code == 7 ~ "ball_acquired_unknown",
+      event_code == 6 ~ "throw_bip_unknown",
+      event_code == 9 ~ "ball_deflection",
+      event_code == 10 ~ "ball_deflection_off_wall",
+      event_code == 11 ~ "home_run",
+      event_code == 16 ~ "ball_bounce",
+      TRUE ~ as.character(event_code)  
+    ),
+    player_position.x = case_when(
+      player_position.x == 1 ~ "pitcher",
+      player_position.x == 2 ~ "catcher",
+      player_position.x == 3 ~ "first_baseman",
+      player_position.x == 4 ~ "second_baseman",
+      player_position.x == 5 ~ "third_baseman",
+      player_position.x == 6 ~ "shortstop",
+      player_position.x == 7 ~ "left_field",
+      player_position.x == 6 ~ "center_field",
+      player_position.x == 9 ~ "right_field",
+      player_position.x == 10 ~ "batter",
+      player_position.x == 11 ~ "runner_1b",
+      player_position.x == 12 ~ "runner_2b",
+      player_position.x == 13 ~ "runner_3b",
+      player_position.x == 255 ~ "no_players",
+      TRUE ~ as.character(player_position.x)  
+    )
+  ) %>%
+  arrange(timestamp) %>%
+  group_by(game_str, play_id) %>%
+  mutate(
+    event_code = zoo::na.locf(
+      ifelse(lag(event_code, default = "start") == "pitch" & is.na(event_code), 
+             "pitch_in_air", event_code), 
+      na.rm = FALSE
+    )
+  ) %>%
+  ungroup()  
+
+# clean main df
+main_4A <- main_4A %>% 
+  select(-play_per_game, -player_position.x, -Season, -HomeTeam, -AwayTeam, -Day, -at_bat)
+```
+
+``` {r}
+# continuing to clean the main df
+
+# update event_code to mark "pre_pitch" events
+main_4A <- main_4A %>%
+  arrange(timestamp) %>%
+  group_by(game_str, play_id) %>%
+  mutate(
+    event_code = {
+      new_event_code <- event_code
+      pitch_indices <- which(event_code == "pitch")
+      for (i in pitch_indices) {
+        start_idx <- ifelse(i == 1, 1, max(1, which(!is.na(new_event_code[1:(i-1)])) + 1))
+        end_idx <- i - 1
+        new_event_code[start_idx:end_idx][is.na(new_event_code[start_idx:end_idx])] <- "pre_pitch"
+      }
+      new_event_code
+    }
+  ) %>%
+  ungroup()
+
+# calculate the closest ball_position_y to 0 for each group
+pitch_location <- main_4A %>% 
+  filter(event_code %in% c("pitch_in_air", "ball_acquired")) %>%
+  group_by(game_str, play_id) %>%
+  mutate(
+    abs_ball_position_y = abs(ball_position_y),
+    closest_to_zero_y = ifelse(n() > 0, ball_position_y[which.min(abs_ball_position_y)], NA_real_),
+    pitch_location_io = case_when(
+      ball_position_y == closest_to_zero_y & ball_position_x < 0 ~ "left",
+      ball_position_y == closest_to_zero_y & ball_position_x > 0 ~ "right",
+      TRUE ~ NA_character_
+    )
+  )
+
+pitch_location <- pitch_location %>%
+  group_by(game_str, play_id) %>%
+  fill(pitch_location_io, .direction = "downup") %>%
+  ungroup()
+
+# remove duplicates
+pitch_location_unique <- pitch_location %>%
+  distinct(game_str, play_id, pitch_location_io, .keep_all = TRUE)
+pitch_location_unique <- pitch_location %>%
+  group_by(game_str, play_id) %>%
+  summarize(pitch_location_io = first(pitch_location_io), .groups = 'drop')
+
+# join cleaned data
+main_4A <- main_4A %>%
+  left_join(pitch_location_unique %>% select(game_str, play_id, pitch_location_io), by = c("game_str", "play_id"))
+
+
+
+# fill pitch_location value for all rows with the same play_id and game_str so 
+main_4A <- main_4A %>%
+  group_by(game_str, play_id) %>%
+  fill(pitch_location_io, .direction = "downup") %>%
+  ungroup()
+
+# arrange the data so we can view it in the timestamp order
+main_4A <- main_4A %>% 
+  arrange(game_str, timestamp)
+
+main_4A <- main_4A %>%
+  group_by(game_str, play_id) %>%
+  fill(batter, pitcher, shortstop, .direction = "downup") %>%
+  ungroup()
+```
+
+```{r}
+# ensure that the only data remaining has pre_pitch data with the same play_id and game_str attached
+
+# extract game_str and play_id for rows with pre_pitch
+game_play_ids_with_pre_pitch_4A <- main_4A %>%
+  filter(event_code == "pre_pitch") %>%
+  select(game_str, play_id) %>%
+  distinct()
+  
+# filter main_4A to include rows with game_str and play_id where pre_pitch takes play within the pitch
+main_4A_filtered <- main_4A %>%
+  semi_join(game_play_ids_with_pre_pitch_4A, by = c("game_str", "play_id")) %>%
+  arrange(game_str, play_id, timestamp) %>% 
+  filter(event_code == "pitch")
+```
+
+
+```{r}
+# calcualting pitch speed based on the ball position being roughly 10 feet in front of the mound
+
+# cleaning up the data and calculating rough speed estimates based on the data
+pitch_speed_data <- main_4A %>%
+  arrange(game_str, play_id, timestamp) %>%
+  group_by(game_str, play_id) %>%
+  mutate(
+    pitch_timestamp = min(timestamp[event_code == "pitch"], na.rm = TRUE),
+      final_pitch_in_play_timestamp = {
+      idx <- which(event_code == "pitch_in_air" & ball_position_y > 45 & ball_position_y < 55 & timestamp > pitch_timestamp)
+      if(length(idx) > 0) timestamp[min(idx)] else NA
+    },
+    within_time_range = timestamp >= pitch_timestamp & timestamp <= final_pitch_in_play_timestamp,
+    horizontal_distance = ifelse(within_time_range,
+                                 abs(ball_position_y - lag(ball_position_y, default = first(ball_position_y))),
+                                 NA),
+      time_diff_ms = ifelse(within_time_range,
+                          timestamp - pitch_timestamp,
+                          NA),
+    # Convert time difference to seconds
+    time_diff_s = time_diff_ms / 1000
+  ) %>%
+  filter(!is.na(within_time_range)) %>%
+  summarize(
+    total_horizontal_distance = sum(horizontal_distance, na.rm = TRUE),
+    total_time_s = max(time_diff_s, na.rm = TRUE),
+    pitch_speed = ifelse(total_time_s > 0, total_horizontal_distance / total_time_s, NA), 
+    pitch_speed_mph = pitch_speed *0.681818
+  ) %>%
+  ungroup()
+
+pitch_speed_data <- pitch_speed_data %>% 
+  filter(pitch_speed_mph <= 106 & pitch_speed_mph >= 55)
+```
+
+```{r}
+# determining vertical break distance to help with later models in predicting pitches
+
+vertical_break_data <- main_4A %>%
+  arrange(game_str, play_id, timestamp) %>%
+  group_by(game_str, play_id) %>%
+  mutate(
+    pitch_timestamp = min(timestamp[event_code == "pitch"], na.rm = TRUE),
+    last_pitch_in_air_timestamp = max(timestamp[event_code == "pitch_in_air"], na.rm = TRUE),
+    post_pitch_in_air_timestamp = lead(last_pitch_in_air_timestamp, order_by = timestamp, default = NA),
+      vertical_break = ifelse(!is.na(pitch_timestamp) & !is.na(post_pitch_in_air_timestamp),
+                            ball_position_z[timestamp == post_pitch_in_air_timestamp] - ball_position_z[timestamp == pitch_timestamp],
+                            NA),
+    # calculate the midpoint timestamp 
+    midpoint_timestamp = pitch_timestamp + (last_pitch_in_air_timestamp - pitch_timestamp) / 2,
+    # calculate the vertical break from midpoint to the post-pitch
+    vertical_break_second_half = ifelse(!is.na(midpoint_timestamp) & !is.na(post_pitch_in_air_timestamp),
+                                        ball_position_z[timestamp == post_pitch_in_air_timestamp] - ball_position_z[timestamp >= midpoint_timestamp & timestamp <= post_pitch_in_air_timestamp],
+                                        NA),
+    # calculate the time duration from midpoint to the post-pitch timestamp in seconds
+    time_duration_second_half_s = ifelse(!is.na(midpoint_timestamp) & !is.na(post_pitch_in_air_timestamp),
+                                         (post_pitch_in_air_timestamp - midpoint_timestamp) / 1000,
+                                         NA),
+    # calculate the vertical break per second 
+    vertical_break_per_second = ifelse(time_duration_second_half_s > 0,
+                                       vertical_break_second_half / time_duration_second_half_s,
+                                       NA)
+  ) %>%
+  summarize(
+    vertical_break = first(vertical_break),
+    vertical_break_per_second = first(vertical_break_per_second)
+  ) %>%
+  ungroup()
+```
+
+```{r}
+# merging the data
+# fill the rest of the data for pitch speed to match play_id
+pitch_speed_data <- pitch_speed_data %>%
+  group_by(game_str, play_id) %>%
+  filter(!is.na(pitch_speed_mph)) %>% 
+  fill(pitch_speed_mph, .direction = "downup") %>%
+  ungroup()
+# fill the rest of the data for vertical break to match play_id
+vertical_break_data <- vertical_break_data %>%
+  group_by(game_str, play_id) %>%
+  fill(vertical_break, vertical_break_per_second, .direction = "downup") %>%
+  ungroup()
+
+# ensure uniqueness 
+pitch_speed_data <- pitch_speed_data %>%
+  group_by(game_str, play_id) %>%
+  summarize(
+    pitch_speed_mph = first(pitch_speed_mph)
+  ) %>%
+  ungroup()
+# ensure uniqueness
+vertical_break_data <- vertical_break_data %>%
+  group_by(game_str, play_id) %>%
+  summarize(
+    vertical_break = first(vertical_break),
+    vertical_break_per_second = first(vertical_break_per_second)
+  ) %>%
+  ungroup()
+
+# merge pitch_speed_data into main_4A
+main_4A <- main_4A %>%
+  left_join(pitch_speed_data %>% select(game_str, play_id, pitch_speed_mph), by = c("game_str", "play_id"))
+# merge vertical_break_data into main_4A
+main_4A <- main_4A %>%
+  left_join(vertical_break_data %>% select(game_str, play_id, vertical_break), by = c("game_str", "play_id"))
+```
+
+```{r}
+# build new variable to determine pitch type
+classify_pitches <- function(data) {
+  threshold_data <- data %>%
+    group_by(pitcher) %>%
+    summarise(
+      top_7_percent_speed = quantile(pitch_speed_mph, 0.93, na.rm = TRUE)
+    ) %>%
+    mutate(
+      fastball_threshold = top_7_percent_speed - 6
+    )
+  
+  data <- data %>%
+    left_join(threshold_data, by = "pitcher") %>%
+    mutate(
+      pitch_type = ifelse(pitch_speed_mph > fastball_threshold, "fastball", "offspeed")
+    )
+  
+  return(data)
+}
+
+# apply the function to classify pitches
+classified_data_break <- classify_pitches(main_4A)
+
+# ensure uniqueness
+classified_data_break_unique <- classified_data_break %>%
+  group_by(game_str, play_id) %>%
+  summarize(
+    pitch_type = first(pitch_type)
+  ) %>%
+  ungroup()
+
+# merge pitch_type back into main_4A
+main_4A <- main_4A %>%
+  left_join(classified_data_break_unique, by = c("game_str", "play_id"))
+```
+
+```{r}
+# filtering data so that balls hit are shown to either the right or left side
+hit_side <- main_4A %>%
+  group_by(game_str, play_id) %>%
+  mutate(is_after_hit = cumsum(event_code == "ball_hit_into_play") > 0) %>%
+  mutate(row_id = row_number()) %>%
+  filter(event_code == "ball_acquired" & is_after_hit & !is.na(ball_position_x)) %>%
+  distinct(play_id, .keep_all = TRUE) %>%
+  ungroup() %>%
+  select(-is_after_hit)
+
+calculate_angle <- function(y, x) {
+  atan2(y, x) * (180 / pi)  
+}
+
+# calculate angle and hit_side
+hit_angle <- hit_side %>%
+  mutate(angle = calculate_angle(ball_position_y, ball_position_x),
+         hit_side = case_when(
+           angle < -15 ~ "left",
+           angle > 15 ~ "right",
+           TRUE ~ "middle"
+         )) %>% 
+  distinct()
+
+# merge with the main df
+main_4A <- main_4A %>% 
+  left_join(hit_angle %>% select(game_str, play_id, angle, hit_side), by = c("game_str", "play_id"))
+
+main_4A <- main_4A %>%
+  group_by(game_str, play_id) %>%
+  fill(angle, hit_side, .direction = "downup") %>%
+  ungroup()
+```
+
+```{r}
+# build a kmeans cluster model to cluster the hitting and pitch data points before building a model to classify hitters. 
+
+# prepare and clean the data
+clustering_data <- hit_angle %>%
+  select(row_id, ball_position_x, ball_position_y, ball_position_z, pitch_location_io, pitch_speed_mph, pitch_type, angle, hit_side) %>%
+  mutate(
+    pitch_type = as.numeric(factor(pitch_type)),
+    pitch_location_io = as.numeric(factor(pitch_location_io)),
+    ball_position_x = round(ball_position_x, 4),
+    ball_position_y = round(ball_position_y, 4),
+    ball_position_z = round(ball_position_z, 4),
+    pitch_speed_mph = round(pitch_speed_mph, 4),
+    angle = round(angle, 4)
+  ) %>%
+  filter(complete.cases(.)) %>%
+  select(-row_id, -hit_side) %>%
+  select(where(is.numeric)) %>%
+  select(where(~ sd(.) != 0)) 
+
+# perform k-means clustering
+set.seed(112)
+kmeans_result <- kmeans(clustering_data, centers = 2)
+
+# new df with results
+clustering_results <- clustering_data %>%
+  mutate(row_id = row_number()) %>% 
+  select(row_id) %>%
+  mutate(cluster = kmeans_result$cluster)
+
+# merge o the original hit_angle df
+filtered_data <- hit_angle %>%
+  left_join(clustering_results, by = "row_id") %>%
+  select(-row_id)  
+
+# switch clusters back to original names
+filtered_data <- filtered_data %>%
+  mutate(handedness = case_when(
+    cluster == 2 ~ 'righty',
+    cluster == 1 ~ 'lefty',
+    TRUE ~ NA_character_
+  ))
+#ensure uniqueness
+filtered_data_unique <- filtered_data %>%
+  distinct(batter, .keep_all = TRUE)
+
+# merge to main df
+main_4A <- main_4A %>%
+  left_join(filtered_data_unique %>% select(batter, handedness), by = "batter")
+```
+
+```{r}
+# filter out all NA shortstop ID's
+main_4A_NA <- main_4A %>% 
+  filter(!is.na(shortstop))
+
+# filter out all shortstops who have no pre-pitch data
+pre_pitch_plays <- main_4A_NA %>%
+  filter(event_code == "pre_pitch") %>%
+  select(play_id, shortstop) %>%
+  distinct()
+
+# filter only play_id's with pre-pitch data
+main_4A_NA_filtered <- main_4A_NA %>%
+  filter(play_id %in% pre_pitch_plays$play_id)
+
+# remove any shortstops without pre-pitch data
+shortstops_with_prepitch <- pre_pitch_plays %>%
+  select(shortstop) %>%
+  distinct()
+main_4A_NA <- main_4A_NA_filtered %>%
+  filter(shortstop %in% shortstops_with_prepitch$shortstop)
+
+# percentile-based binarization to create new binary pitch vertical break varibale for modeling
+percentile_50 <- quantile(main_4A_NA$vertical_break, .50, na.rm = TRUE)
+main_4A_NA$vertical_break_high <- ifelse(main_4A_NA$vertical_break > percentile_50, 1, 0)
+```
+
+```{r}
+# filtering data so we only have 3 seconds before the pitch and data while the pitch is in the air
+valid_play_ids <- main_4A_NA %>%
+  filter(event_code %in% c("pre_pitch", "pitch", "pitch_in_air")) %>%
+  group_by(game_str, play_id) %>%
+  summarize(
+    has_pre_pitch = any(event_code == "pre_pitch"),
+    has_pitch = any(event_code == "pitch"),
+    has_ball_in_air = any(event_code == "pitch_in_air"),
+    .groups = 'drop'
+  ) %>%
+  filter(has_pre_pitch & has_pitch & has_ball_in_air) %>%
+  select(game_str, play_id)
+
+# filter data for only those event codes
+main_4A_NA <- main_4A_NA %>%
+  inner_join(valid_play_ids, by = c("game_str", "play_id"))
+
+# determine final pitch time
+pitch_in_air_time_5 <- main_4A_NA %>%
+  group_by(game_str, play_id) %>%
+  filter(event_code == "pitch") %>%
+  summarize(final_pitch_in_air_time = max(timestamp, na.rm = TRUE), .groups = 'drop')
+
+# merge to main df
+main_4A_NA <- main_4A_NA %>%
+  left_join(pitch_in_air_time_5, by = c("game_str", "play_id"))
+
+main_4A_NA <- main_4A_NA %>%
+  mutate(pre_pitch_window = timestamp >= (final_pitch_in_air_time - 3000) & timestamp <= final_pitch_in_air_time) %>%
+  filter(pre_pitch_window | event_code %in% c("pre_pitch", "pitch", "pitch_in_air"))
+```
+
+```{r}
+# calculating the net movements for shortstops to determine "pre-pitch movment"
+main_4A_NA_right <- main_4A_NA %>%
+  filter(handedness == "righty")
+
+main_4A_NA_left <- main_4A_NA %>%
+  filter(handedness == "lefty")
+
+# function to calculate net movement
+calculate_net_movement <- function(data, suffix) {
+  net_movement <- data %>%
+    group_by(game_str, play_id) %>%
+    arrange(timestamp) %>%
+    summarize(
+      net_field_x_movement = last(field_x) - first(field_x),
+      net_field_y_movement = last(field_y) - first(field_y),
+      .groups = 'drop'
+    )
+  
+  net_movement <- net_movement %>%
+    mutate(
+      mean_x_movement = mean(net_field_x_movement, na.rm = TRUE),
+      sd_x_movement = sd(net_field_x_movement, na.rm = TRUE),
+      z_score_x = (net_field_x_movement - mean_x_movement) / sd_x_movement
+    ) %>%
+    filter(abs(z_score_x) <= 3) %>%
+    select(-mean_x_movement, -sd_x_movement, -z_score_x) %>%
+    mutate(
+      mean_y_movement = mean(net_field_y_movement, na.rm = TRUE),
+      sd_y_movement = sd(net_field_y_movement, na.rm = TRUE),
+      z_score_y = (net_field_y_movement - mean_y_movement) / sd_y_movement
+    ) %>%
+    filter(abs(z_score_y) <= 3) %>%
+    select(-mean_y_movement, -sd_y_movement, -z_score_y) %>%
+    rename_with(~ paste0(., suffix), c("net_field_x_movement", "net_field_y_movement"))
+  
+  return(net_movement)
+}
+
+net_movement_right <- calculate_net_movement(main_4A_NA_right, "_righty")
+net_movement_left <- calculate_net_movement(main_4A_NA_left, "_lefty")
+
+# merge movement to main df
+main_4A_NA <- main_4A_NA %>%
+  left_join(net_movement_right, by = c("game_str", "play_id")) %>%
+  left_join(net_movement_left, by = c("game_str", "play_id"))
+```
+
+```{r}
+main_4A_NA <- main_4A_NA %>% 
+  select(-pitcher, -batter, -final_pitch_in_air_time, -pre_pitch_window)
+# write a csv for the shortstop master df to use in the shiny
+write.csv(main_4A_NA, "main_4A_NA.csv")
+```
+
+predicting the pitch location when lefty hitter
+```{r}
+# filter for lefties
+main_4A_NA_Lefty <- main_4A_NA %>% 
+  filter(handedness == "lefty")
+
+# transform to binary
+main_4A_NA_Lefty$pitch_location_io_binary <- ifelse(main_4A_NA_Lefty$pitch_location_io == "left", 1, 0)
+
+# remove na in predictors
+main_4A_NA_Lefty <- main_4A_NA_Lefty %>% 
+  filter(!is.na(net_field_x_movement_lefty) & !is.na(net_field_y_movement_lefty))
+
+model1 <- glm(pitch_location_io_binary ~ net_field_x_movement_lefty + net_field_y_movement_lefty, 
+             data = main_4A_NA_Lefty, 
+             family = binomial)
+
+#summary(model1)
+
+predicted_probs1 <- predict(model1, type = "response")
+predicted_pitch_location1 <- ifelse(predicted_probs1 > 0.5, 1, 0)
+confusion_matrix1 <- table(Predicted = predicted_pitch_location1, Actual = main_4A_NA_Lefty$pitch_location_io_binary)
+
+#print(confusion_matrix1)
+
+# dalculate evaluation metrics
+accuracy1 <- sum(diag(confusion_matrix1)) / sum(confusion_matrix1)
+precision1 <- confusion_matrix1[2,2] / sum(confusion_matrix1[2,])
+recall1 <- confusion_matrix1[2,2] / sum(confusion_matrix1[,2])
+f1_score1 <- 2 * (precision1 * recall1) / (precision1 + recall1)
+
+cat("Accuracy:", accuracy1, "\n")
+cat("Precision:", precision1, "\n")
+cat("Recall:", recall1, "\n")
+cat("F1 Score:", f1_score1, "\n")
+
+
+confusion_matrix_df1 <- as.data.frame(as.table(confusion_matrix1))
+
+# create heatmap
+ggplot(confusion_matrix_df1, aes(x = Actual, y = Predicted, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq), color = "black", size = 5) +  
+  scale_fill_gradient(low = "yellow", high = "red") +  
+  scale_x_discrete(labels = c("0" = "Right", "1" = "Left")) +
+  scale_y_discrete(labels = c("0" = "Right", "1" = "Left")) +
+  labs(x = "Actual", y = "Predicted", fill = "Count") +
+  ggtitle("Predicting Pitch Location - Lefty Batter") +
+  theme_minimal() +
+  theme(
+    axis.title.x = element_text(size = 14),  
+    axis.title.y = element_text(size = 14), 
+    axis.text.x = element_text(size = 12),    
+    axis.text.y = element_text(size = 12),    
+    plot.title = element_text(size = 16)     
+  )
+
+```
+
+predicting the pitch_type when a lefty hitter
+```{r}
+# filter for lefty
+main_4A_NA_Lefty <- main_4A_NA %>% 
+  filter(handedness == "lefty")
+
+# transform to binary
+main_4A_NA_Lefty$pitch_type_binary <- ifelse(main_4A_NA_Lefty$pitch_type == "fastball", 1, 0)
+
+# remove na from predictors
+main_4A_NA_Lefty <- main_4A_NA_Lefty %>% 
+  filter(!is.na(net_field_x_movement_lefty) & !is.na(net_field_y_movement_lefty) & !is.na(pitch_type_binary))
+
+model2 <- glm(pitch_type_binary ~ net_field_x_movement_lefty + net_field_y_movement_lefty, 
+             data = main_4A_NA_Lefty, 
+             family = binomial)
+
+#summary(model2)
+
+predicted_probs2 <- predict(model2, type = "response")
+
+summary(predicted_probs2)
+hist(predicted_probs2, breaks = 50, main = "Histogram of Predicted Probabilities", xlab = "Probability")
+
+threshold2 <- 0.6  
+predicted_pitch_type2 <- ifelse(predicted_probs2 > threshold2, 1, 0)
+confusion_matrix2 <- table(Predicted = predicted_pitch_type2, Actual = main_4A_NA_Lefty$pitch_type_binary)
+
+#print(confusion_matrix2)
+
+# calculate evaluation metrics
+accuracy2 <- sum(diag(confusion_matrix2)) / sum(confusion_matrix2)
+precision2 <- confusion_matrix2[2,2] / sum(confusion_matrix2[2,])
+recall2 <- confusion_matrix2[2,2] / sum(confusion_matrix2[,2])
+f1_score2 <- 2 * (precision2 * recall2) / (precision2 + recall2)
+
+cat("Accuracy:", accuracy2, "\n")
+cat("Precision:", precision2, "\n")
+cat("Recall:", recall2, "\n")
+cat("F1 Score:", f1_score2, "\n")
+
+
+confusion_matrix_df2 <- as.data.frame(as.table(confusion_matrix2))
+
+# create heatmap 
+ggplot(confusion_matrix_df2, aes(x = Actual, y = Predicted, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq), color = "black", size = 5) +  
+  scale_fill_gradient(low = "yellow", high = "red") +  
+  scale_x_discrete(labels = c("0" = "Offspeed", "1" = "Fastball")) +
+  scale_y_discrete(labels = c("0" = "Offspeed", "1" = "Fastball")) +
+  labs(x = "Actual", y = "Predicted", fill = "Count") +
+  ggtitle("Predicting Pitch Type - Lefty Batter") +
+  theme_minimal()+
+  theme(
+    axis.title.x = element_text(size = 14),  
+    axis.title.y = element_text(size = 14),  
+    axis.text.x = element_text(size = 12),    
+    axis.text.y = element_text(size = 12),   
+    plot.title = element_text(size = 16)     
+  )
+```
+
+predicting the pitch vertical break when lefty hitter
+```{r}
+# filter for lefty
+main_4A_NA_Lefty <- main_4A_NA %>% 
+  filter(handedness == "lefty")
+
+# remove na from predictors
+main_4A_NA_Lefty <- main_4A_NA_Lefty %>% 
+  filter(!is.na(net_field_x_movement_lefty) & !is.na(net_field_y_movement_lefty) & !is.na(vertical_break_high))
+
+model3 <- glm(vertical_break_high ~ net_field_x_movement_lefty + net_field_y_movement_lefty, 
+             data = main_4A_NA_Lefty, 
+             family = binomial)
+
+#summary(model3)
+
+predicted_probs3 <- predict(model3,type = "response")
+predicted_pitch_location3 <- ifelse(predicted_probs3 > 0.5, 1, 0)
+confusion_matrix3 <- table(Predicted = predicted_pitch_location3, Actual = main_4A_NA_Lefty$vertical_break_high)
+
+#print(confusion_matrix3)
+
+# calculate evaluation metrics
+accuracy3 <- sum(diag(confusion_matrix3)) / sum(confusion_matrix3)
+precision3 <- confusion_matrix3[2,2] / sum(confusion_matrix3[2,])
+recall3 <- confusion_matrix3[2,2] / sum(confusion_matrix3[,2])
+f1_score3 <- 2 * (precision3 * recall3) / (precision3 + recall3)
+
+cat("Accuracy:", accuracy3, "\n")
+cat("Precision:", precision3, "\n")
+cat("Recall:", recall3, "\n")
+cat("F1 Score:", f1_score3, "\n")
+
+confusion_matrix_df3 <- as.data.frame(as.table(confusion_matrix3))
+
+# create heatmap 
+ggplot(confusion_matrix_df3, aes(x = Actual, y = Predicted, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq), color = "black", size = 5) + 
+  scale_fill_gradient(low = "yellow", high = "red") +  
+  scale_x_discrete(labels = c("0" = "Little", "1" = "High")) +
+  scale_y_discrete(labels = c("0" = "Little", "1" = "High")) +
+  labs(x = "Actual", y = "Predicted", fill = "Count") +
+  ggtitle("Predicting Vertical Break - Lefty Batter") +
+  theme_minimal()+
+  theme(
+    axis.title.x = element_text(size = 14),  
+    axis.title.y = element_text(size = 14),  
+    axis.text.x = element_text(size = 12),   
+    axis.text.y = element_text(size = 12),    
+    plot.title = element_text(size = 16)     
+  )
+```
+
+
+
+predicting the pitch location when righty hitter
+```{r}
+# filter for righty
+main_4A_NA_Righty <- main_4A_NA %>% 
+  filter(handedness == "righty")
+
+# transform to binary
+main_4A_NA_Righty$pitch_location_io_binary <- ifelse(main_4A_NA_Righty$pitch_location_io == "right", 1, 0)
+
+# remove na from predictors
+main_4A_NA_Righty <- main_4A_NA_Righty %>% 
+  filter(!is.na(net_field_x_movement_righty) & !is.na(net_field_y_movement_righty))
+
+model4 <- glm(pitch_location_io_binary ~ net_field_x_movement_righty + net_field_y_movement_righty, 
+             data = main_4A_NA_Righty, 
+             family = binomial)
+
+#summary(model4)
+
+predicted_probs4 <- predict(model4, type = "response")
+predicted_pitch_location4 <- ifelse(predicted_probs4 > 0.5, 1, 0)
+confusion_matrix4 <- table(Predicted = predicted_pitch_location4, Actual = main_4A_NA_Righty$pitch_location_io_binary)
+
+#print(confusion_matrix4)
+
+# calculate evaluation metrics
+accuracy4 <- sum(diag(confusion_matrix4)) / sum(confusion_matrix4)
+precision4 <- confusion_matrix4[2,2] / sum(confusion_matrix4[2,])
+recall4 <- confusion_matrix4[2,2] / sum(confusion_matrix4[,2])
+f1_score4 <- 2 * (precision4 * recall4) / (precision4 + recall4)
+
+cat("Accuracy:", accuracy4, "\n")
+cat("Precision:", precision4, "\n")
+cat("Recall:", recall4, "\n")
+cat("F1 Score:", f1_score4, "\n")
+
+
+confusion_matrix_df4 <- as.data.frame(as.table(confusion_matrix4))
+
+# create heatmap 
+ggplot(confusion_matrix_df4, aes(x = Actual, y = Predicted, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq), color = "black", size = 5) +  
+  scale_fill_gradient(low = "yellow", high = "red") +  
+  scale_x_discrete(labels = c("0" = "Right", "1" = "Left")) +
+  scale_y_discrete(labels = c("0" = "Right", "1" = "Left")) +
+  labs(x = "Actual", y = "Predicted", fill = "Count") +
+  ggtitle("Predicting Pitch Location - Righty Batter") +
+  theme_minimal()+
+  theme(
+    axis.title.x = element_text(size = 14),  
+    axis.title.y = element_text(size = 14),  
+    axis.text.x = element_text(size = 12),   
+    axis.text.y = element_text(size = 12),  
+    plot.title = element_text(size = 16)  
+  )
+```
+
+predicting the pitch_type when a righty hitter
+```{r}
+# filter for righty
+main_4A_NA_Righty <- main_4A_NA %>% 
+  filter(handedness == "righty")
+
+# transform to binary
+main_4A_NA_Righty$pitch_type_binary <- ifelse(main_4A_NA_Righty$pitch_type == "fastball", 1, 0)
+
+# remove na from predictors
+main_4A_NA_Righty <- main_4A_NA_Righty %>% 
+  filter(!is.na(net_field_x_movement_righty) & !is.na(net_field_y_movement_righty) & !is.na(pitch_type_binary))
+
+model5 <- glm(pitch_type_binary ~ net_field_x_movement_righty + net_field_y_movement_righty, 
+             data = main_4A_NA_Righty, 
+             family = binomial)
+
+#summary(model5)
+
+predicted_probs5 <- predict(model5, type = "response")
+#summary(predicted_probs5)
+hist(predicted_probs5, breaks = 50, main = "Histogram of Predicted Probabilities", xlab = "Probability")
+
+threshold5 <- 0.6  
+predicted_pitch_type5 <- ifelse(predicted_probs5 > threshold5, 1, 0)
+confusion_matrix5 <- table(Predicted = predicted_pitch_type5, Actual = main_4A_NA_Righty$pitch_type_binary)
+
+#print(confusion_matrix5)
+
+# calculate evaluation metrics
+accuracy5 <- sum(diag(confusion_matrix5)) / sum(confusion_matrix5)
+precision5 <- confusion_matrix5[2,2] / sum(confusion_matrix5[2,])
+recall5 <- confusion_matrix5[2,2] / sum(confusion_matrix5[,2])
+f1_score5 <- 2 * (precision5 * recall5) / (precision5 + recall5)
+
+cat("Accuracy:", accuracy5, "\n")
+cat("Precision:", precision5, "\n")
+cat("Recall:", recall5, "\n")
+cat("F1 Score:", f1_score5, "\n")
+
+
+confusion_matrix_df5 <- as.data.frame(as.table(confusion_matrix5))
+
+# create heatmap 
+ggplot(confusion_matrix_df5, aes(x = Actual, y = Predicted, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq), color = "black", size = 5) +  
+  scale_fill_gradient(low = "yellow", high = "red") +  
+  scale_x_discrete(labels = c("0" = "Offspeed", "1" = "Fastball")) +
+  scale_y_discrete(labels = c("0" = "Offspeed", "1" = "Fastball")) +
+  labs(x = "Actual", y = "Predicted", fill = "Count") +
+  ggtitle("Predicting Pitch Type - Righty Batter") +
+  theme_minimal()+
+  theme(
+    axis.title.x = element_text(size = 14),  
+    axis.title.y = element_text(size = 14),
+    axis.text.x = element_text(size = 12),   
+    axis.text.y = element_text(size = 12),  
+    plot.title = element_text(size = 16)   
+  )
+```
+
+predicting the pitch vertical break when righty hitter
+```{r}
+# filter for righty
+main_4A_NA_Righty <- main_4A_NA %>% 
+  filter(handedness == "righty")
+
+# remove na from predictors
+main_4A_NA_Righty <- main_4A_NA_Righty %>% 
+  filter(!is.na(net_field_x_movement_righty) & !is.na(net_field_y_movement_righty))
+
+model6 <- glm(vertical_break_high ~ net_field_x_movement_righty + net_field_y_movement_righty, 
+             data = main_4A_NA_Righty, 
+             family = binomial)
+
+#summary(model6)
+
+predicted_probs6 <- predict(model6, type = "response")
+predicted_pitch_location6 <- ifelse(predicted_probs6 > 0.5, 1, 0)
+main_4A_NA_Righty <- main_4A_NA_Righty %>% 
+  filter(!is.na(vertical_break_high))
+confusion_matrix6 <- table(Predicted = predicted_pitch_location6, Actual = main_4A_NA_Righty$vertical_break_high)
+
+#print(confusion_matrix6)
+
+# calculate evaluation metrics
+accuracy6 <- sum(diag(confusion_matrix6)) / sum(confusion_matrix6)
+precision6 <- confusion_matrix6[2,2] / sum(confusion_matrix6[2,])
+recall6 <- confusion_matrix6[2,2] / sum(confusion_matrix6[,2])
+f1_score6 <- 2 * (precision6 * recall6) / (precision6 + recall6)
+
+cat("Accuracy:", accuracy6, "\n")
+cat("Precision:", precision6, "\n")
+cat("Recall:", recall6, "\n")
+cat("F1 Score:", f1_score6, "\n")
+
+confusion_matrix_df6 <- as.data.frame(as.table(confusion_matrix6))
+
+# create heatmap 
+ggplot(confusion_matrix_df6, aes(x = Actual, y = Predicted, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq), color = "black", size = 5) +  
+  scale_fill_gradient(low = "yellow", high = "red") +  
+  scale_x_discrete(labels = c("0" = "Little", "1" = "High")) +
+  scale_y_discrete(labels = c("0" = "Little", "1" = "High")) +
+  labs(x = "Actual", y = "Predicted", fill = "Count") +
+  ggtitle("Predicting Vertical Break - Righty Batter") +
+  theme_minimal()+
+  theme(
+    axis.title.x = element_text(size = 14),  
+    axis.title.y = element_text(size = 14),  
+    axis.text.x = element_text(size = 12),    
+    axis.text.y = element_text(size = 12),    
+    plot.title = element_text(size = 16) 
+  )
+```
+
+```{r}
+# Define results for each model
+results_lefty_pitch_location <- data.frame(
+  Model = "Lefty_Pitch_Location",
+  Accuracy = accuracy1,
+  Precision = precision1,
+  Recall = recall1,
+  F1_Score = f1_score1
+)
+
+results_lefty_pitch_type <- data.frame(
+  Model = "Lefty_Pitch_Type",
+  Accuracy = accuracy2,
+  Precision = precision2,
+  Recall = recall2,
+  F1_Score = f1_score2
+)
+
+results_righty_pitch_location <- data.frame(
+  Model = "Righty_Pitch_Location",
+  Accuracy = accuracy3,
+  Precision = precision3,
+  Recall = recall3,
+  F1_Score = f1_score3
+)
+
+results_righty_pitch_type <- data.frame(
+  Model = "Righty_Pitch_Type",
+  Accuracy = accuracy4,
+  Precision = precision4,
+  Recall = recall4,
+  F1_Score = f1_score4
+)
+
+results_lefty_vertical_break <- data.frame(
+  Model = "Lefty_Vertical_Break",
+  Accuracy = accuracy5,
+  Precision = precision5,
+  Recall = recall5,
+  F1_Score = f1_score5
+)
+
+results_righty_vertical_break <- data.frame(
+  Model = "Righty_Vertical_Break",
+  Accuracy = accuracy6,
+  Precision = precision6,
+  Recall = recall6,
+  F1_Score = f1_score6
+)
+
+
+# Combine all results data frames into one
+results_df <- rbind(
+  results_lefty_pitch_location,
+  results_lefty_pitch_type,
+  results_righty_pitch_location,
+  results_righty_pitch_type,
+  results_lefty_vertical_break,
+  results_righty_vertical_break
+)
+
+# Print the combined results data frame
+print(results_df)
+```
+
+```{r}
+# write a csv for the the model results
+write.csv(results_df, "glm_results.csv")
+```
