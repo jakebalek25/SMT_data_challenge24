@@ -2,6 +2,5 @@
 
 Submitted to the 2024 SMT Data Challenge Undergraduate Division.
 
-## SMT DC Rules
-This file contains the highlighted rules
-
+## SMT Data
+The data cannot be uploaded due to the extremely large nature of the datasets. Please contact me to gain access to the data at jakebalek@gmail.com
